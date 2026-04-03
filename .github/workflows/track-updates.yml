@@ -11,15 +11,15 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Restore cached state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .cache/tracker/state.json
           key: ${{ runner.os }}-tracker-state
@@ -33,7 +33,7 @@ jobs:
 
       - name: Save updated state
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .cache/tracker/state.json
           key: ${{ runner.os }}-tracker-state-${{ github.run_id }}-${{ github.run_attempt }}
