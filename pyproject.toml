@@ -1,0 +1,9 @@
+[project]
+name = "site-scrapes"
+version = "0.1.0"
+description = "Track configured page updates and notify Discord."
+requires-python = ">=3.12"
+dependencies = [
+  "requests>=2.32,<3",
+]
+

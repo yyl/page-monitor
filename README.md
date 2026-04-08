@@ -7,15 +7,15 @@ This repo checks configured pages for updates and posts to Discord when somethin
 Local:
 
 ```bash
-python3 -m unittest discover -s tests
-python3 scripts/check_updates.py --state-path .cache/tracker/state.json --dry-run
+uv run python -m unittest discover -s tests
+uv run python scripts/check_updates.py --state-path .cache/tracker/state.json --dry-run
 ```
 
 Local with real Discord notifications:
 
 ```bash
 export DISCORD_WEBHOOK_URL="your-webhook-url"
-python3 scripts/check_updates.py --state-path .cache/tracker/state.json
+uv run python scripts/check_updates.py --state-path .cache/tracker/state.json
 ```
 
 GitHub:
@@ -28,6 +28,7 @@ GitHub:
 ## File structure
 
 - `config/tracker.json`: list of tracked targets. Each target includes a `type`, `url`, and optional `name`.
+- `pyproject.toml`: project metadata and Python dependencies managed by `uv`.
 - `scripts/check_updates.py`: main checker script. Fetches pages, parses the latest update info, compares against saved state, and sends Discord notifications.
 - `tests/test_check_updates.py`: parser tests.
 - `.github/workflows/track-updates.yml`: scheduled GitHub Action that restores state, runs the checker, and saves updated state.

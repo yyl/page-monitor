@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
 from typing import Any
+import requests
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -51,6 +52,10 @@ class ManhuaguiUpdate:
     @property
     def fingerprint(self) -> str:
         return f"{self.updated_date}|{self.latest_issue}|{self.latest_issue_url}"
+
+
+class NotificationError(RuntimeError):
+    pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -189,18 +194,32 @@ def build_notification_lines(updates: list[ManhuaguiUpdate]) -> list[str]:
 
 
 def send_discord_notification(webhook_url: str, updates: list[ManhuaguiUpdate]) -> None:
-    payload = json.dumps(
-        {"content": "\n".join(build_notification_lines(updates))},
-        ensure_ascii=False,
-    ).encode("utf-8")
-    request = Request(
-        webhook_url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urlopen(request, timeout=20):
+    try:
+        response = requests.post(
+            webhook_url,
+            json={"content": "\n".join(build_notification_lines(updates))},
+            headers={"User-Agent": USER_AGENT},
+            timeout=20,
+        )
+        response.raise_for_status()
         return
+    except requests.HTTPError as exc:
+        response = exc.response
+        status_code = response.status_code if response is not None else "unknown"
+        reason = response.reason if response is not None else "Unknown"
+        response_body = response.text.strip() if response is not None else ""
+
+        message = f"Discord webhook request failed with HTTP {status_code} {reason}."
+        if response_body:
+            message += f" Response body: {response_body}"
+        if status_code == 403:
+            message += (
+                " This usually means the webhook URL is invalid, revoked, or no longer "
+                "allowed to post to that channel."
+            )
+        raise NotificationError(message) from exc
+    except requests.RequestException as exc:
+        raise NotificationError(f"Discord webhook request failed: {exc}") from exc
 
 
 def main() -> int:
@@ -261,11 +280,15 @@ def main() -> int:
         )
         return 1
 
-    send_discord_notification(webhook_url, updates)
+    try:
+        send_discord_notification(webhook_url, updates)
+    except NotificationError as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        return 1
+
     print(f"Sent Discord notification for {len(updates)} update(s).", flush=True)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
