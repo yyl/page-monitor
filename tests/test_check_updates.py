@@ -1,10 +1,11 @@
 import unittest
 from unittest.mock import call
 from unittest.mock import patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 import requests
 
 from scripts.check_updates import (
+    FETCH_RETRY_ATTEMPTS,
     FETCH_RETRY_DELAY_SECONDS,
     NotificationError,
     fetch_html,
@@ -96,19 +97,39 @@ class FetchHtmlTests(unittest.TestCase):
 
     def test_raises_after_exhausting_retries(self) -> None:
         error = URLError(TimeoutError("timed out"))
+        attempts = FETCH_RETRY_ATTEMPTS
 
         with (
-            patch("scripts.check_updates.urlopen", side_effect=[error, error, error]),
+            patch("scripts.check_updates.urlopen", side_effect=[error] * attempts),
             patch("scripts.check_updates.time.sleep") as mock_sleep,
         ):
             with self.assertRaises(URLError):
                 fetch_html("https://example.com", timeout=20)
 
-        self.assertEqual(mock_sleep.call_count, 2)
+        self.assertEqual(mock_sleep.call_count, attempts - 1)
         self.assertEqual(
             mock_sleep.call_args_list,
-            [call(FETCH_RETRY_DELAY_SECONDS), call(FETCH_RETRY_DELAY_SECONDS)],
+            [call(FETCH_RETRY_DELAY_SECONDS)] * (attempts - 1),
         )
+
+    def test_does_not_retry_http_errors(self) -> None:
+        error = HTTPError(
+            url="https://example.com",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+
+        with (
+            patch("scripts.check_updates.urlopen", side_effect=error) as mock_urlopen,
+            patch("scripts.check_updates.time.sleep") as mock_sleep,
+        ):
+            with self.assertRaises(HTTPError):
+                fetch_html("https://example.com", timeout=20)
+
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_sleep.assert_not_called()
 
 
 class DiscordNotificationTests(unittest.TestCase):

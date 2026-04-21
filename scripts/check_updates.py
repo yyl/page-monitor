@@ -141,7 +141,18 @@ def fetch_html(url: str, timeout: int) -> str:
             with urlopen(request, timeout=timeout) as response:
                 charset = response.headers.get_content_charset() or "utf-8"
                 return response.read().decode(charset, errors="replace")
-        except (TimeoutError, URLError, ssl.SSLError) as exc:
+        except HTTPError:
+            raise
+        except ssl.SSLError as exc:
+            if attempt == FETCH_RETRY_ATTEMPTS:
+                raise URLError(exc) from exc
+            print(
+                f"Fetch attempt {attempt} for {url} failed: {exc}. Retrying...",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(FETCH_RETRY_DELAY_SECONDS)
+        except (TimeoutError, URLError) as exc:
             if attempt == FETCH_RETRY_ATTEMPTS:
                 raise
             print(
