@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import ssl
 import sys
 import time
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/135.0.0.0 Safari/537.36"
 )
+FETCH_RETRY_ATTEMPTS = 3
+FETCH_RETRY_DELAY_SECONDS = 2
 
 STATUS_BLOCK_RE = re.compile(r'<li\s+class="status">\s*(.*?)\s*</li>', re.DOTALL)
 TITLE_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.DOTALL | re.IGNORECASE)
@@ -132,9 +135,25 @@ def fetch_html(url: str, timeout: int) -> str:
             "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
         },
     )
-    with urlopen(request, timeout=timeout) as response:
-        charset = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(charset, errors="replace")
+
+    last_error: TimeoutError | URLError | ssl.SSLError | None = None
+    for attempt in range(1, FETCH_RETRY_ATTEMPTS + 1):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                charset = response.headers.get_content_charset() or "utf-8"
+                return response.read().decode(charset, errors="replace")
+        except (TimeoutError, URLError, ssl.SSLError) as exc:
+            last_error = exc
+            if attempt == FETCH_RETRY_ATTEMPTS:
+                raise
+            print(
+                f"Fetch attempt {attempt} for {url} failed: {exc}. Retrying...",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(FETCH_RETRY_DELAY_SECONDS * attempt)
+
+    raise RuntimeError(f"Failed to fetch {url}: {last_error}")
 
 
 def clean_html_text(value: str) -> str:

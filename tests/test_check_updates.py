@@ -1,8 +1,33 @@
 import unittest
 from unittest.mock import patch
+from urllib.error import URLError
 import requests
 
-from scripts.check_updates import NotificationError, parse_manhuagui_page, send_discord_notification
+from scripts.check_updates import (
+    NotificationError,
+    fetch_html,
+    parse_manhuagui_page,
+    send_discord_notification,
+)
+
+
+class _ResponseStub:
+    def __init__(self, body: bytes, charset: str = "utf-8") -> None:
+        self._body = body
+        self.headers = self
+        self._charset = charset
+
+    def __enter__(self) -> "_ResponseStub":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def get_content_charset(self) -> str:
+        return self._charset
+
+    def read(self) -> bytes:
+        return self._body
 
 
 class ParseManhuaguiPageTests(unittest.TestCase):
@@ -48,6 +73,36 @@ class ParseManhuaguiPageTests(unittest.TestCase):
         self.assertEqual(parsed.updated_date, "2026-04-01")
         self.assertEqual(parsed.latest_issue, "第1话")
         self.assertEqual(parsed.latest_issue_url, "https://www.manhuagui.com/comic/1/2.html")
+
+
+class FetchHtmlTests(unittest.TestCase):
+    def test_retries_transient_url_errors(self) -> None:
+        response = _ResponseStub(b"<html>ok</html>")
+
+        with (
+            patch(
+                "scripts.check_updates.urlopen",
+                side_effect=[URLError(TimeoutError("timed out")), response],
+            ) as mock_urlopen,
+            patch("scripts.check_updates.time.sleep") as mock_sleep,
+        ):
+            html = fetch_html("https://example.com", timeout=20)
+
+        self.assertEqual(html, "<html>ok</html>")
+        self.assertEqual(mock_urlopen.call_count, 2)
+        mock_sleep.assert_called_once_with(2)
+
+    def test_raises_after_exhausting_retries(self) -> None:
+        error = URLError(TimeoutError("timed out"))
+
+        with (
+            patch("scripts.check_updates.urlopen", side_effect=[error, error, error]),
+            patch("scripts.check_updates.time.sleep") as mock_sleep,
+        ):
+            with self.assertRaises(URLError):
+                fetch_html("https://example.com", timeout=20)
+
+        self.assertEqual(mock_sleep.call_count, 2)
 
 
 class DiscordNotificationTests(unittest.TestCase):
