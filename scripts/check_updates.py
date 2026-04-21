@@ -136,14 +136,12 @@ def fetch_html(url: str, timeout: int) -> str:
         },
     )
 
-    last_error: TimeoutError | URLError | ssl.SSLError | None = None
     for attempt in range(1, FETCH_RETRY_ATTEMPTS + 1):
         try:
             with urlopen(request, timeout=timeout) as response:
                 charset = response.headers.get_content_charset() or "utf-8"
                 return response.read().decode(charset, errors="replace")
         except (TimeoutError, URLError, ssl.SSLError) as exc:
-            last_error = exc
             if attempt == FETCH_RETRY_ATTEMPTS:
                 raise
             print(
@@ -151,9 +149,7 @@ def fetch_html(url: str, timeout: int) -> str:
                 file=sys.stderr,
                 flush=True,
             )
-            time.sleep(FETCH_RETRY_DELAY_SECONDS * attempt)
-
-    raise RuntimeError(f"Failed to fetch {url}: {last_error}")
+            time.sleep(FETCH_RETRY_DELAY_SECONDS)
 
 
 def clean_html_text(value: str) -> str:

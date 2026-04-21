@@ -1,9 +1,11 @@
 import unittest
+from unittest.mock import call
 from unittest.mock import patch
 from urllib.error import URLError
 import requests
 
 from scripts.check_updates import (
+    FETCH_RETRY_DELAY_SECONDS,
     NotificationError,
     fetch_html,
     parse_manhuagui_page,
@@ -11,17 +13,17 @@ from scripts.check_updates import (
 )
 
 
-class _ResponseStub:
+class UrllibResponseStub:
     def __init__(self, body: bytes, charset: str = "utf-8") -> None:
         self._body = body
         self.headers = self
         self._charset = charset
 
-    def __enter__(self) -> "_ResponseStub":
+    def __enter__(self) -> "UrllibResponseStub":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        return None
+        pass
 
     def get_content_charset(self) -> str:
         return self._charset
@@ -77,7 +79,7 @@ class ParseManhuaguiPageTests(unittest.TestCase):
 
 class FetchHtmlTests(unittest.TestCase):
     def test_retries_transient_url_errors(self) -> None:
-        response = _ResponseStub(b"<html>ok</html>")
+        response = UrllibResponseStub(b"<html>ok</html>")
 
         with (
             patch(
@@ -90,7 +92,7 @@ class FetchHtmlTests(unittest.TestCase):
 
         self.assertEqual(html, "<html>ok</html>")
         self.assertEqual(mock_urlopen.call_count, 2)
-        mock_sleep.assert_called_once_with(2)
+        mock_sleep.assert_called_once_with(FETCH_RETRY_DELAY_SECONDS)
 
     def test_raises_after_exhausting_retries(self) -> None:
         error = URLError(TimeoutError("timed out"))
@@ -103,6 +105,10 @@ class FetchHtmlTests(unittest.TestCase):
                 fetch_html("https://example.com", timeout=20)
 
         self.assertEqual(mock_sleep.call_count, 2)
+        self.assertEqual(
+            mock_sleep.call_args_list,
+            [call(FETCH_RETRY_DELAY_SECONDS), call(FETCH_RETRY_DELAY_SECONDS)],
+        )
 
 
 class DiscordNotificationTests(unittest.TestCase):
