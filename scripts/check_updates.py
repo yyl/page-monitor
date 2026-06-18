@@ -232,8 +232,12 @@ def main() -> int:
     next_state: dict[str, dict[str, str]] = {}
     updates: list[ManhuaguiUpdate] = []
 
-    for target in targets:
+    for i, target in enumerate(targets):
         url = target["url"]
+
+        if i > 0:
+            time.sleep(3)
+
         print(f"Checking {url}...", flush=True)
 
         try:
