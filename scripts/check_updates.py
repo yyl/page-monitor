@@ -37,12 +37,16 @@ ISSUE_RE = re.compile(
     r"""更新至\s*\[\s*<a\s+href=["']([^"']+)["'][^>]*class=["']blue["'][^>]*>\s*([^<]+?)\s*</a>\s*\]""",
     re.DOTALL,
 )
+COMIX_INITIAL_DATA_RE = re.compile(
+    r"""<script\b[^>]*\s+id=["']initial-data["'][^>]*>(.*?)</script>""",
+    re.DOTALL | re.IGNORECASE,
+)
 TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
 
 
 @dataclass
-class ManhuaguiUpdate:
+class ChapterUpdate:
     name: str
     url: str
     updated_date: str
@@ -144,7 +148,7 @@ def clean_html_text(value: str) -> str:
 
 def parse_manhuagui_page(
     html: str, page_url: str, configured_name: str | None = None
-) -> ManhuaguiUpdate:
+) -> ChapterUpdate:
     status_match = STATUS_BLOCK_RE.search(html)
     if not status_match:
         raise ValueError(f"Could not find status block on {page_url}")
@@ -162,7 +166,7 @@ def parse_manhuagui_page(
     title_match = TITLE_RE.search(html)
     page_title = clean_html_text(title_match.group(1)) if title_match else page_url
 
-    return ManhuaguiUpdate(
+    return ChapterUpdate(
         name=configured_name or page_title,
         url=page_url,
         updated_date=clean_html_text(date_match.group(1)),
@@ -171,7 +175,37 @@ def parse_manhuagui_page(
     )
 
 
-def check_target(target: dict[str, Any], timeout: int) -> ManhuaguiUpdate:
+def parse_comix_page(
+    html: str, page_url: str, configured_name: str | None = None
+) -> ChapterUpdate:
+    initial_data = COMIX_INITIAL_DATA_RE.search(html)
+    if not initial_data:
+        raise ValueError(f"Could not find Comix title metadata on {page_url}")
+
+    try:
+        data = json.loads(initial_data.group(1))
+        title_id = data["manga"]["hid"]
+        detail_key = json.dumps(["manga", "detail", title_id], separators=(",", ":"))
+        details = data["queries"][detail_key]
+        title = details["title"]
+        chapter = details["latestChapter"]
+        chapter_url = details["latestChapterUrl"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid Comix title metadata on {page_url}") from exc
+
+    if type(chapter) not in (int, float) or not isinstance(chapter_url, str) or not chapter_url:
+        raise ValueError(f"Could not find latest chapter on {page_url}")
+
+    return ChapterUpdate(
+        name=configured_name or title,
+        url=page_url,
+        updated_date="",  # Comix exposes a relative age, which changes between checks.
+        latest_issue=f"Chapter {chapter}",
+        latest_issue_url=urljoin(page_url, chapter_url),
+    )
+
+
+def check_target(target: dict[str, Any], timeout: int) -> ChapterUpdate:
     target_type = target["type"]
     url = target["url"]
     configured_name = target.get("name")
@@ -180,20 +214,23 @@ def check_target(target: dict[str, Any], timeout: int) -> ManhuaguiUpdate:
 
     if target_type == "manhuagui":
         return parse_manhuagui_page(html, url, configured_name=configured_name)
+    if target_type == "comix":
+        return parse_comix_page(html, url, configured_name=configured_name)
 
     raise ValueError(f"Unsupported target type: {target_type}")
 
 
-def build_notification_lines(updates: list[ManhuaguiUpdate]) -> list[str]:
+def build_notification_lines(updates: list[ChapterUpdate]) -> list[str]:
     lines = ["New updates detected:"]
     for update in updates:
+        date = f" ({update.updated_date})" if update.updated_date else ""
         lines.append(
-            f"- {update.name}: {update.latest_issue} ({update.updated_date}) {update.latest_issue_url}"
+            f"- {update.name}: {update.latest_issue}{date} {update.latest_issue_url}"
         )
     return lines
 
 
-def send_discord_notification(webhook_url: str, updates: list[ManhuaguiUpdate]) -> None:
+def send_discord_notification(webhook_url: str, updates: list[ChapterUpdate]) -> None:
     try:
         response = requests.post(
             webhook_url,
@@ -230,7 +267,7 @@ def main() -> int:
     targets = load_config(config_path)
     previous_state = load_state(state_path)
     next_state: dict[str, dict[str, str]] = {}
-    updates: list[ManhuaguiUpdate] = []
+    updates: list[ChapterUpdate] = []
 
     for i, target in enumerate(targets):
         url = target["url"]

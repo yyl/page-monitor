@@ -27,7 +27,7 @@ GitHub:
 
 ## File structure
 
-- `config/tracker.json`: list of tracked targets. Each target includes a `type`, `url`, and optional `name`.
+- `config/tracker.json`: list of tracked targets. Each target includes a `type` (`manhuagui` or `comix`), `url`, and optional `name`. Use desktop `www.manhuagui.com` comic URLs and `comix.to/title/…` title URLs.
 - `pyproject.toml`: project metadata and Python dependencies managed by `uv`.
 - `scripts/check_updates.py`: main checker script. Fetches pages, parses the latest update info, compares against saved state, and sends Discord notifications.
 - `tests/test_check_updates.py`: parser tests.
@@ -38,8 +38,8 @@ GitHub:
 ## How it works
 
 1. The script reads `config/tracker.json`.
-2. For each target, it fetches the page and parses the latest updated date, issue title, and issue link.
+2. For each target, it fetches the page and parses the latest chapter and its link. Manhuagui also provides an update date.
 3. It compares the latest values with `.cache/tracker/state.json`.
-4. On the first run, it seeds the state and sends no notification.
+4. On the first check for each target, it seeds the state silently.
 5. On later runs, if any target changed, it sends one Discord message listing the updates.
 6. In GitHub Actions, the state file is restored from cache at the start of a scheduled run and saved back after a successful run.

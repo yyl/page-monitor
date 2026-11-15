@@ -1,8 +1,16 @@
+import json
 import unittest
 from unittest.mock import patch
 import requests
 
-from scripts.check_updates import NotificationError, parse_manhuagui_page, send_discord_notification
+from scripts.check_updates import (
+    NotificationError,
+    build_notification_lines,
+    check_target,
+    parse_comix_page,
+    parse_manhuagui_page,
+    send_discord_notification,
+)
 
 
 class ParseManhuaguiPageTests(unittest.TestCase):
@@ -48,6 +56,48 @@ class ParseManhuaguiPageTests(unittest.TestCase):
         self.assertEqual(parsed.updated_date, "2026-04-01")
         self.assertEqual(parsed.latest_issue, "第1话")
         self.assertEqual(parsed.latest_issue_url, "https://www.manhuagui.com/comic/1/2.html")
+
+
+class ParseComixPageTests(unittest.TestCase):
+    url = "https://comix.to/title/test-example-comic"
+
+    def page_html(self, chapter: float, chapter_id: int, age: str) -> str:
+        data = {
+            "manga": {"hid": "test"},
+            "queries": {
+                '["manga","detail","test"]': {
+                    "title": "Example Comic",
+                    "latestChapter": chapter,
+                    "latestChapterUrl": f"/title/test-example-comic/{chapter_id}-chapter-{chapter}",
+                    "chapterUpdatedAtFormatted": age,
+                },
+            },
+        }
+        return f'<script type="application/json" id="initial-data">{json.dumps(data)}</script>'
+
+    def test_dispatches_comix_and_formats_chapter_notification(self) -> None:
+        target = {"type": "comix", "url": self.url}
+        with patch("scripts.check_updates.fetch_html", return_value=self.page_html(6.5, 123, "1h ago")):
+            update = check_target(target, timeout=20)
+
+        self.assertEqual(update.url, self.url)
+        self.assertEqual(
+            build_notification_lines([update])[-1],
+            f"- Example Comic: Chapter 6.5 {self.url}/123-chapter-6.5",
+        )
+
+    def test_fingerprint_tracks_chapter_changes_and_ignores_relative_age(self) -> None:
+        earlier = parse_comix_page(self.page_html(6, 123, "1h ago"), self.url)
+        later = parse_comix_page(self.page_html(6, 123, "2h ago"), self.url)
+        new_chapter = parse_comix_page(self.page_html(7, 124, "1h ago"), self.url)
+
+        self.assertEqual(earlier.fingerprint, later.fingerprint)
+        self.assertNotEqual(later.fingerprint, new_chapter.fingerprint)
+
+    def test_rejects_missing_chapter_metadata(self) -> None:
+        html = '<script type="application/json" id="initial-data">{}</script>'
+        with self.assertRaisesRegex(ValueError, "Invalid Comix title metadata"):
+            parse_comix_page(html, self.url)
 
 
 class DiscordNotificationTests(unittest.TestCase):
