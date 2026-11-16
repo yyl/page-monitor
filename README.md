@@ -38,8 +38,8 @@ GitHub:
 ## How it works
 
 1. The script reads `config/tracker.json`.
-2. For each target, it fetches the page and parses the latest chapter and its link. Manhuagui also provides an update date.
-3. It compares the latest values with `.cache/tracker/state.json`.
+2. It reads the chapter list on Manhuagui and the latest chapter on Comix.
+3. It compares the results with `.cache/tracker/state.json`. A failed check keeps that target's previous state while other targets continue.
 4. On the first check for each target, it seeds the state silently.
-5. On later runs, if any target changed, it sends one Discord message listing the updates.
+5. On later runs, it sends one Discord message with every newly listed Manhuagui chapter and each changed Comix chapter. If the latest Comix chapter number jumps by more than one, the alert also links to the title page so you can check for intermediate releases. Large batches include the full list as a text attachment.
 6. In GitHub Actions, the state file is restored from cache at the start of a scheduled run and saved back after a successful run.

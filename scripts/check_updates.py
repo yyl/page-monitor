@@ -8,13 +8,15 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal
 from html import unescape
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 import requests
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -37,12 +39,17 @@ ISSUE_RE = re.compile(
     r"""更新至\s*\[\s*<a\s+href=["']([^"']+)["'][^>]*class=["']blue["'][^>]*>\s*([^<]+?)\s*</a>\s*\]""",
     re.DOTALL,
 )
+MANHUAGUI_CHAPTER_RE = re.compile(
+    r'<a\s+href="(/comic/\d+/(\d+)\.html)"\s+title="([^"]*)"\s+class="status\d+"'
+)
 COMIX_INITIAL_DATA_RE = re.compile(
     r"""<script\b[^>]*\s+id=["']initial-data["'][^>]*>(.*?)</script>""",
     re.DOTALL | re.IGNORECASE,
 )
+COMIX_CHAPTER_NUMBER_RE = re.compile(r"Chapter (\d+(?:\.\d+)?)")
 TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
+TrackerState = dict[str, dict[str, Any]]
 
 
 @dataclass
@@ -52,10 +59,17 @@ class ChapterUpdate:
     updated_date: str
     latest_issue: str
     latest_issue_url: str
+    note: str = ""
 
     @property
     def fingerprint(self) -> str:
         return f"{self.updated_date}|{self.latest_issue}|{self.latest_issue_url}"
+
+
+@dataclass
+class TargetSnapshot:
+    latest: ChapterUpdate
+    chapters: dict[int, ChapterUpdate] | None = None
 
 
 class NotificationError(RuntimeError):
@@ -109,7 +123,7 @@ def load_config(config_path: Path) -> list[dict[str, Any]]:
     return normalized
 
 
-def load_state(state_path: Path) -> dict[str, dict[str, str]]:
+def load_state(state_path: Path) -> TrackerState:
     if not state_path.exists():
         return {}
 
@@ -121,11 +135,17 @@ def load_state(state_path: Path) -> dict[str, dict[str, str]]:
     return data
 
 
-def save_state(state_path: Path, state: dict[str, dict[str, str]]) -> None:
+def save_state(state_path: Path, state: TrackerState) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    with state_path.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
+    handle = NamedTemporaryFile(mode="w", encoding="utf-8", dir=state_path.parent, delete=False)
+    temporary_path = Path(handle.name)
+    try:
+        with handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        temporary_path.replace(state_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def fetch_html(url: str, timeout: int) -> str:
@@ -205,7 +225,27 @@ def parse_comix_page(
     )
 
 
-def check_target(target: dict[str, Any], timeout: int) -> ChapterUpdate:
+def parse_manhuagui_chapters(html: str, latest: ChapterUpdate) -> dict[int, ChapterUpdate]:
+    comic_path = urlsplit(latest.url).path.rstrip("/") + "/"
+    chapters = {
+        int(chapter_id): replace(
+            latest,
+            updated_date="",
+            latest_issue=clean_html_text(title),
+            latest_issue_url=urljoin(MANHUAGUI_BASE_URL, path),
+        )
+        for path, chapter_id, title in MANHUAGUI_CHAPTER_RE.findall(html)
+        if path.startswith(comic_path)
+    }
+    if not chapters:
+        raise ValueError(f"Could not find Manhuagui chapter list on {latest.url}")
+
+    latest_id = int(Path(urlsplit(latest.latest_issue_url).path).stem)
+    chapters[latest_id] = latest
+    return chapters
+
+
+def check_target(target: dict[str, Any], timeout: int) -> TargetSnapshot:
     target_type = target["type"]
     url = target["url"]
     configured_name = target.get("name")
@@ -213,11 +253,41 @@ def check_target(target: dict[str, Any], timeout: int) -> ChapterUpdate:
     html = fetch_html(url, timeout=timeout)
 
     if target_type == "manhuagui":
-        return parse_manhuagui_page(html, url, configured_name=configured_name)
+        latest = parse_manhuagui_page(html, url, configured_name=configured_name)
+        return TargetSnapshot(latest, parse_manhuagui_chapters(html, latest))
     if target_type == "comix":
-        return parse_comix_page(html, url, configured_name=configured_name)
+        return TargetSnapshot(parse_comix_page(html, url, configured_name=configured_name))
 
     raise ValueError(f"Unsupported target type: {target_type}")
+
+
+def manhuagui_updates(
+    chapters: dict[int, ChapterUpdate], previous: dict[str, Any]
+) -> tuple[list[ChapterUpdate], list[int]]:
+    if not previous:
+        return [], sorted(chapters)
+
+    if "seen_chapter_ids" in previous:
+        seen = set(previous["seen_chapter_ids"])
+    else:
+        # Old state stores only the most recent upload. Manhuagui IDs increase by upload.
+        previous_id = int(Path(urlsplit(previous["latest_issue_url"]).path).stem)
+        seen = {chapter_id for chapter_id in chapters if chapter_id <= previous_id}
+        seen.add(previous_id)
+
+    new_ids = sorted(chapters.keys() - seen)
+    return [chapters[chapter_id] for chapter_id in new_ids], sorted(seen.union(chapters))
+
+
+def comix_update(latest: ChapterUpdate, previous: dict[str, Any]) -> ChapterUpdate:
+    before = COMIX_CHAPTER_NUMBER_RE.fullmatch(previous.get("latest_issue", ""))
+    after = COMIX_CHAPTER_NUMBER_RE.fullmatch(latest.latest_issue)
+    if before and after and Decimal(after[1]) - Decimal(before[1]) > 1:
+        return replace(
+            latest,
+            note=f"Previously {before[0]}. Check the title page for chapters in between: {latest.url}",
+        )
+    return latest
 
 
 def build_notification_lines(updates: list[ChapterUpdate]) -> list[str]:
@@ -227,16 +297,28 @@ def build_notification_lines(updates: list[ChapterUpdate]) -> list[str]:
         lines.append(
             f"- {update.name}: {update.latest_issue}{date} {update.latest_issue_url}"
         )
+        if update.note:
+            lines.append(f"  {update.note}")
     return lines
 
 
 def send_discord_notification(webhook_url: str, updates: list[ChapterUpdate]) -> None:
+    content = "\n".join(build_notification_lines(updates))
+    if len(content.encode("utf-16-le")) // 2 <= 2000:
+        body = {"json": {"content": content}}
+    else:
+        summary = f"{len(updates)} new updates detected. See the attached chapter list."
+        body = {
+            "data": {"payload_json": json.dumps({"content": summary})},
+            "files": {"files[0]": ("chapter-updates.txt", content.encode("utf-8"), "text/plain")},
+        }
     try:
         response = requests.post(
             webhook_url,
-            json={"content": "\n".join(build_notification_lines(updates))},
+            params={"wait": "true"},
             headers={"User-Agent": USER_AGENT},
             timeout=20,
+            **body,
         )
         response.raise_for_status()
         return
@@ -266,8 +348,9 @@ def main() -> int:
 
     targets = load_config(config_path)
     previous_state = load_state(state_path)
-    next_state: dict[str, dict[str, str]] = {}
+    next_state: TrackerState = {}
     updates: list[ChapterUpdate] = []
+    checked_count = 0
 
     for i, target in enumerate(targets):
         url = target["url"]
@@ -276,13 +359,23 @@ def main() -> int:
             time.sleep(3)
 
         print(f"Checking {url}...", flush=True)
+        previous = previous_state.get(url, {})
 
         try:
-            parsed = check_target(target, timeout=args.timeout)
+            snapshot = check_target(target, timeout=args.timeout)
+            parsed = snapshot.latest
+            if snapshot.chapters is not None:
+                new_chapters, seen_ids = manhuagui_updates(snapshot.chapters, previous)
+                updates.extend(new_chapters)
+            elif previous and previous.get("fingerprint") != parsed.fingerprint:
+                updates.append(comix_update(parsed, previous))
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             print(f"Failed to check {url}: {exc}", file=sys.stderr, flush=True)
-            return 1
+            if previous:
+                next_state[url] = previous
+            continue
 
+        checked_count += 1
         next_state[url] = {
             "type": target["type"],
             "name": parsed.name,
@@ -292,10 +385,27 @@ def main() -> int:
             "fingerprint": parsed.fingerprint,
             "checked_at": int(time.time()),
         }
+        if snapshot.chapters is not None:
+            next_state[url]["seen_chapter_ids"] = seen_ids
 
-        previous = previous_state.get(url)
-        if previous and previous.get("fingerprint") != parsed.fingerprint:
-            updates.append(parsed)
+    if targets and not checked_count:
+        return 1
+
+    if updates and not args.dry_run:
+        webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+        if not webhook_url:
+            print(
+                "Updates were detected, but DISCORD_WEBHOOK_URL is not set.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+
+        try:
+            send_discord_notification(webhook_url, updates)
+        except NotificationError as exc:
+            print(str(exc), file=sys.stderr, flush=True)
+            return 1
 
     save_state(state_path, next_state)
 
@@ -311,21 +421,6 @@ def main() -> int:
         print("\n".join(build_notification_lines(updates)), flush=True)
         print("Dry run enabled, skipping Discord delivery.", flush=True)
         return 0
-
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    if not webhook_url:
-        print(
-            "Updates were detected, but DISCORD_WEBHOOK_URL is not set.",
-            file=sys.stderr,
-            flush=True,
-        )
-        return 1
-
-    try:
-        send_discord_notification(webhook_url, updates)
-    except NotificationError as exc:
-        print(str(exc), file=sys.stderr, flush=True)
-        return 1
 
     print(f"Sent Discord notification for {len(updates)} update(s).", flush=True)
     return 0

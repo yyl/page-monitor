@@ -1,12 +1,18 @@
 import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from urllib.error import URLError
 import requests
 
 from scripts.check_updates import (
+    ChapterUpdate,
     NotificationError,
     build_notification_lines,
     check_target,
+    comix_update,
+    main,
     parse_comix_page,
     parse_manhuagui_page,
     send_discord_notification,
@@ -78,7 +84,7 @@ class ParseComixPageTests(unittest.TestCase):
     def test_dispatches_comix_and_formats_chapter_notification(self) -> None:
         target = {"type": "comix", "url": self.url}
         with patch("scripts.check_updates.fetch_html", return_value=self.page_html(6.5, 123, "1h ago")):
-            update = check_target(target, timeout=20)
+            update = check_target(target, timeout=20).latest
 
         self.assertEqual(update.url, self.url)
         self.assertEqual(
@@ -99,8 +105,107 @@ class ParseComixPageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid Comix title metadata"):
             parse_comix_page(html, self.url)
 
+    def test_comix_jump_preserves_latest_link_and_points_to_title(self) -> None:
+        latest = parse_comix_page(self.page_html(9, 125, "1h ago"), self.url)
+        update = comix_update(latest, {"latest_issue": "Chapter 6.5"})
+
+        lines = build_notification_lines([update])
+        self.assertIn(latest.latest_issue_url, lines[1])
+        self.assertIn("Previously Chapter 6.5", lines[2])
+        self.assertTrue(lines[2].endswith(self.url))
+        self.assertEqual(comix_update(latest, {"latest_issue": "Chapter 8"}), latest)
+
+
+class TrackerRunTests(unittest.TestCase):
+    manhuagui_url = "https://www.manhuagui.com/comic/34536/"
+    comix_url = "https://comix.to/title/test-example-comic"
+    old_chapter_url = manhuagui_url + "100.html"
+    page = """
+        <h1>Test Title</h1>
+        <li class="status"><span>最近于 [<span class="red">2026-11-16</span>]
+            更新至 [ <a href="/comic/34536/109.html" class="blue">第88话</a> ]</span></li>
+        <a href="/comic/34536/109.html" title="第88话" class="status0"><span>第88话<i>20p</i></span></a>
+        <a href="/comic/34536/100.html" title="第86话" class="status0">第86话</a>
+        <a href="/comic/34536/104.html" title="第87话" class="status0">第87话</a>
+        <a href="/comic/34536/104.html" title="第87话" class="status0">第87话</a>
+        <a href="/comic/99999/110.html" title="Unrelated" class="status0">Unrelated</a>
+    """
+
+    def setUp(self) -> None:
+        directory = Path(self.enterContext(TemporaryDirectory()))
+        config = directory / "config.json"
+        self.state_path = directory / "state.json"
+        config.write_text(json.dumps({"targets": [
+            {"type": "manhuagui", "url": self.manhuagui_url},
+            {"type": "comix", "url": self.comix_url},
+        ]}))
+        self.enterContext(patch("sys.argv", [
+            "check_updates.py", "--config-path", str(config), "--state-path", str(self.state_path),
+        ]))
+        self.enterContext(patch("builtins.print"))
+        self.enterContext(patch("scripts.check_updates.time.sleep"))
+        self.enterContext(patch("scripts.check_updates.fetch_html", side_effect=self.fetch_page))
+        self.enterContext(patch.dict("os.environ", {"DISCORD_WEBHOOK_URL": "https://discord.invalid"}))
+        self.send = self.enterContext(patch("scripts.check_updates.send_discord_notification"))
+
+    def fetch_page(self, url: str, timeout: int) -> str:
+        if url == self.comix_url:
+            raise URLError("Unavailable")
+        return self.page
+
+    def test_migrates_old_state_and_sends_all_new_links_once(self) -> None:
+        comix_previous = {"latest_issue": "Chapter 6"}
+        self.state_path.write_text(json.dumps({
+            self.manhuagui_url: {"latest_issue_url": self.old_chapter_url},
+            self.comix_url: comix_previous,
+        }))
+
+        self.assertEqual(main(), 0)
+        self.send.assert_called_once()
+        updates = self.send.call_args.args[1]
+        self.assertEqual([update.latest_issue for update in updates], ["第87话", "第88话"])
+        self.assertEqual([update.latest_issue_url for update in updates], [
+            self.manhuagui_url + "104.html", self.manhuagui_url + "109.html",
+        ])
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(state[self.comix_url], comix_previous)
+        self.assertEqual(state[self.manhuagui_url]["seen_chapter_ids"], [100, 104, 109])
+        self.assertEqual(main(), 0)
+        self.send.assert_called_once()
+
+    def test_first_check_seeds_the_full_list_silently(self) -> None:
+        self.assertEqual(main(), 0)
+        self.send.assert_not_called()
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(state[self.manhuagui_url]["seen_chapter_ids"], [100, 104, 109])
+
+    def test_delivery_failure_keeps_the_batch_available_for_retry(self) -> None:
+        previous = json.dumps({self.manhuagui_url: {"latest_issue_url": self.old_chapter_url}})
+        self.state_path.write_text(previous)
+        self.send.side_effect = NotificationError("Unavailable")
+
+        self.assertEqual(main(), 1)
+        self.assertEqual(self.state_path.read_text(), previous)
+        self.send.side_effect = None
+        self.assertEqual(main(), 0)
+        self.assertEqual(self.send.call_args_list[0], self.send.call_args_list[1])
+
 
 class DiscordNotificationTests(unittest.TestCase):
+    def test_large_batch_attaches_every_chapter_in_one_message(self) -> None:
+        updates = [
+            ChapterUpdate("Test Title", "", "", f"Chapter {i}", f"https://example.org/chapter/{i}")
+            for i in range(50)
+        ]
+        with patch("scripts.check_updates.requests.post") as post:
+            send_discord_notification("https://discord.invalid", updates)
+
+        post.assert_called_once()
+        request = post.call_args.kwargs
+        self.assertEqual(request["params"], {"wait": "true"})
+        _, attachment, _ = request["files"]["files[0]"]
+        self.assertEqual(attachment.decode("utf-8").splitlines(), build_notification_lines(updates))
+
     def test_surfaces_discord_error_details(self) -> None:
         update = parse_manhuagui_page(
             """
